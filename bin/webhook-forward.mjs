@@ -47,11 +47,11 @@ const server = http.createServer((req, res) => {
       "content-type": req.headers["content-type"] || "application/json",
       "content-length": String(body.length),
     };
-    if (req.headers.authorization) {
-      headers.authorization = req.headers.authorization;
-    }
-    if (req.headers["x-grok-signature"]) {
-      headers["x-grok-signature"] = req.headers["x-grok-signature"];
+    for (const name of ["authorization", "x-grok-signature", "idempotency-key", "x-grok-message-id"]) {
+      const value = req.headers[name];
+      if (typeof value === "string" && value) {
+        headers[name] = value;
+      }
     }
 
     const client = upstreamUrl.protocol === "https:" ? https : http;
