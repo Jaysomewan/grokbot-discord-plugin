@@ -61,7 +61,10 @@ describe("postGrokWebhook", () => {
     assert.equal(calls[0]?.init.method, "POST");
     const body = String(calls[0]?.init.body);
     assert.equal(body.includes("ghp_"), false);
-    assert.match(String((calls[0]?.init.headers as Record<string, string>)["x-grok-signature"]), /^sha256=/);
+    const headers = calls[0]?.init.headers as Record<string, string>;
+    assert.match(String(headers["x-grok-signature"]), /^sha256=/);
+    assert.equal(headers["idempotency-key"], payload.message_id);
+    assert.equal(headers["x-grok-message-id"], payload.message_id);
   });
 });
 

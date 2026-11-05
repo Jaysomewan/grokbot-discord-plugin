@@ -52,7 +52,7 @@ Direct HTTPS is the default. If the gateway log shows `Invalid IP address: undef
 - `GROK_WEBHOOK_UPSTREAM` = the real api2 automations URL
 - same `GROK_WEBHOOK_SECRET`
 
-`bin/with-env.sh` starts `bin/webhook-forward.mjs` when 127.0.0.1:8787 is down. The forwarder copies `Authorization` and `X-Grok-Signature`. Do not disable the SSRF DNS pin.
+`bin/with-env.sh` starts `bin/webhook-forward.mjs` when 127.0.0.1:8787 is down. The forwarder copies `Authorization`, `X-Grok-Signature`, `Idempotency-Key`, and `X-Grok-Message-Id`. Do not disable the SSRF DNS pin.
 
 Put this prompt on the inbound routine:
 
@@ -86,6 +86,8 @@ SILENCE in these cases:
 - Ambient chat that happened to contain the bot name as a word.
 - Anything that is not a real request to this bot.
 - You have nothing useful to say.
+- This message_id was already handled. A timed-out POST can be retried
+  with the same message_id; do not answer twice.
 
 Answer when:
 - The author @mentions the bot and is asking it to do something.

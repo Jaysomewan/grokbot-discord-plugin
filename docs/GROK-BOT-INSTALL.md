@@ -97,7 +97,9 @@ Fail-closed before any webhook or reply:
 
 If `DISCORD_ALLOWED_ROLE_IDS` is non-empty, members without those roles are dropped even when the line is directed. Empty means anyone in the allowlisted channel may talk. `discord_history` is stricter: other users are omitted unless they hold an allowed role. Empty role list does **not** mean history includes the whole channel.
 
-Directed inbound (see **Who the bot answers**) POSTs JSON to `GROK_WEBHOOK_URL` with `X-Grok-Signature: sha256=...` and `Authorization: Bearer <secret>`.
+Directed inbound (see **Who the bot answers**) POSTs JSON to `GROK_WEBHOOK_URL` with `X-Grok-Signature: sha256=...` and `Authorization: Bearer <secret>`. The POST also sets `Idempotency-Key` and `X-Grok-Message-Id` to `message_id`.
+
+A 2xx is stored in `~/.grok-discord/webhook-ledger-*.json` and is not sent again. Network errors, timeouts, HTTP 429, and HTTP 5xx stay pending and retry with backoff, including after a process restart. A permanent 4xx stops. If a try times out after the routine has already started, the same `message_id` can be delivered again. The routine must SILENCE a `message_id` it already handled.
 
 If `GROK_WEBHOOK_URL` is missing, directed chat is dropped:
 
@@ -114,11 +116,22 @@ Local room commands do **not** use the webhook. They send from the gateway:
 
 Both fail if Discord send is 403 / 50013. A silent `/status` is a **permission** problem, not a webhook problem.
 
-Ready log:
+Ready log (once per process):
 
 ```
 grok-discord ready as <tag>; one replica per bot token
 ```
+
+Heartbeat acks and presence updates can keep moving after Discord stops delivering message events. The worker compares allowlisted channel history over REST with the messages the gateway actually emitted. When a message is past the grace window and was never emitted, the worker posts that message and re-identifies a new session. A heartbeat ack that goes stale does the same. The same process then logs:
+
+```
+grok-discord gateway inbound stalled; re-identifying missed=<message ids>
+grok-discord gateway heartbeat stale; re-identifying
+grok-discord gateway reconnecting shard=0
+grok-discord gateway session ready shard=0
+```
+
+`gateway session ready` means this process finished a re-identify. Two `grok-discord ready as ...` lines still mean two processes.
 
 If the webhook URL is unset at boot, the worker also prints that inbound will not wake a Grok Bot. That boot line and the drop line are the source of truth. Do **not** use `discord_status.webhookConfigured`.
 
@@ -170,7 +183,7 @@ If the gateway log still shows `Invalid IP address: undefined`, do **not** disab
 | `GROK_WEBHOOK_UPSTREAM` | Real api2 automations webhook URL |
 | `GROK_WEBHOOK_SECRET` | Same sender key the host already has |
 
-`bin/webhook-forward.mjs` forwards `content-type`, `Authorization`, and `X-Grok-Signature`. `bin/with-env.sh` starts it if `127.0.0.1:8787` is down. After changing these values, `discord_restart_worker`. One replica.
+`bin/webhook-forward.mjs` forwards `content-type`, `Authorization`, `X-Grok-Signature`, `Idempotency-Key`, and `X-Grok-Message-Id`. `bin/with-env.sh` starts it if `127.0.0.1:8787` is down. After changing these values, `discord_restart_worker`. One replica.
 
 ## Install sequence
 
@@ -322,6 +335,8 @@ SILENCE in these cases:
 - Ambient chat that happened to contain the bot name as a word.
 - Anything that is not a real request to this bot.
 - You have nothing useful to say.
+- This message_id was already handled. A timed-out POST can be retried
+  with the same message_id; do not answer twice.
 
 Answer when:
 - The author @mentions the bot and is asking it to do something.
@@ -380,6 +395,8 @@ Use this table when the install is not clean. These are the failures that happen
 | Bot talks in DMs | Should be impossible | DMs have no `guildId`. Stop and inspect; do not add DM intents. |
 | `discord_history` looks empty of other people | Other users omitted unless they hold an allowed role | Empty `DISCORD_ALLOWED_ROLE_IDS` allows anyone to talk, not to appear as peers in history. |
 | Need to post a screenshot; `discord_send` has no file field | MCP send/reply cannot attach | Raw multipart POST to the channel messages endpoint. Invite needs Attach Files. |
-| Two ready lines / Discord reconnect storms | Two gateway processes on one token | Kill extras. One supervisor, one gateway. MCP must never open a Gateway. |
+| Gateway stays ready, presence still updates, @mentions do not move inbound `lastRunAt`, and the log has no rate-limit drop | Discord kept the socket and heartbeat acks but stopped dispatching message events | Wait for `gateway inbound stalled` or `gateway heartbeat stale`, then `gateway session ready`. The missed message ids are posted before the re-identify. Keep one replica. |
+| Inbound routine runs twice for one Discord message | A POST timed out after the routine accepted it, and the ledger retried that `message_id` | SILENCE a `message_id` already handled. After a 2xx the worker does not send that id again. |
+| Two `grok-discord ready as ...` lines / Discord reconnect storms | Two gateway processes on one token | Kill extras. One supervisor, one gateway. `gateway session ready` is this process recovering. MCP must never open a Gateway. |
 | Agent opens a Gateway inside MCP | Agent drift | **Stop.** MCP is REST only. Tools listed above. |
 | Watchdog firing every 5 minutes | Wrong default | Replace with one weekday daily alive-check (`27 8 * * 1-5`). |

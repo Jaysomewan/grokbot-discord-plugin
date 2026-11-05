@@ -48,14 +48,23 @@ export type WebhookDeps = {
   lookup?: AddressLookup;
 };
 
+export type WebhookPostResult =
+  | { ok: true; status: number }
+  | { ok: false; status?: number; error: string };
+
 export function signWebhookBody(body: string, secret: string): string {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
-export function webhookHeaders(body: string, secret?: string): Record<string, string> {
+export function webhookHeaders(body: string, secret?: string, idempotencyKey?: string): Record<string, string> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
   };
+
+  if (idempotencyKey) {
+    headers["idempotency-key"] = idempotencyKey;
+    headers["x-grok-message-id"] = idempotencyKey;
+  }
 
   if (!secret) {
     return headers;
@@ -72,6 +81,22 @@ export function sanitizeWebhookPayload(payload: WebhookPayload): WebhookPayload 
     author_username: redactSecrets(payload.author_username),
     content: redactSecrets(payload.content),
   };
+}
+
+function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  work.catch(() => undefined);
+  return Promise.race([
+    work,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+      timer.unref();
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 function postPinnedJson(
@@ -119,38 +144,57 @@ function postPinnedJson(
   });
 }
 
+export async function postGrokWebhookResult(
+  url: string,
+  payload: WebhookPayload,
+  secret?: string,
+  deps: WebhookDeps = {},
+): Promise<WebhookPostResult> {
+  if (!secret) {
+    return { ok: false, error: "GROK_WEBHOOK_SECRET is required when GROK_WEBHOOK_URL is set" };
+  }
+
+  try {
+    const pinned = await withDeadline(pinWebhookAddress(url, deps.lookup), webhookTimeoutMs, "webhook timeout");
+    const body = JSON.stringify(sanitizeWebhookPayload(payload));
+    const headers = webhookHeaders(body, secret, payload.message_id);
+
+    if (deps.fetchImpl) {
+      const response = await deps.fetchImpl(url, {
+        method: "POST",
+        headers,
+        body,
+        redirect: "error",
+        signal: AbortSignal.timeout(webhookTimeoutMs),
+      });
+
+      if (!response.ok) {
+        return { ok: false, status: response.status, error: `webhook ${response.status}` };
+      }
+
+      return { ok: true, status: response.status };
+    }
+
+    const response = await postPinnedJson(url, pinned, headers, body);
+    if (response.status < 200 || response.status >= 300) {
+      return { ok: false, status: response.status, error: `webhook ${response.status}` };
+    }
+
+    return { ok: true, status: response.status };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "webhook failed";
+    return { ok: false, error: message };
+  }
+}
+
 export async function postGrokWebhook(
   url: string,
   payload: WebhookPayload,
   secret?: string,
   deps: WebhookDeps = {},
 ): Promise<void> {
-  if (!secret) {
-    throw new Error("GROK_WEBHOOK_SECRET is required when GROK_WEBHOOK_URL is set");
-  }
-
-  const pinned = await pinWebhookAddress(url, deps.lookup);
-  const body = JSON.stringify(sanitizeWebhookPayload(payload));
-  const headers = webhookHeaders(body, secret);
-
-  if (deps.fetchImpl) {
-    const response = await deps.fetchImpl(url, {
-      method: "POST",
-      headers,
-      body,
-      redirect: "error",
-      signal: AbortSignal.timeout(webhookTimeoutMs),
-    });
-
-    if (!response.ok) {
-      throw new Error(`webhook ${response.status}`);
-    }
-
-    return;
-  }
-
-  const response = await postPinnedJson(url, pinned, headers, body);
-  if (response.status < 200 || response.status >= 300) {
-    throw new Error(`webhook ${response.status}`);
+  const result = await postGrokWebhookResult(url, payload, secret, deps);
+  if (!result.ok) {
+    throw new Error(result.status ? `webhook ${result.status}` : result.error);
   }
 }
